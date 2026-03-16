@@ -72,6 +72,8 @@ class Script(modules.scripts.Script):
         self.ipa = None
 
         self.enable_rp_latent = False
+        self.modeltype = "SD"
+        self.anima_patched = False
         
     def title(self):
         return "NegPiP"
@@ -149,6 +151,9 @@ class Script(modules.scripts.Script):
                 self.modeltype = modeltype = "ZImage"
                 input = SdConditioning([""], width=p.width, height=p.height)
                 p.sd_model.text_processing_engine_gemma(input)
+            elif type(p.sd_model).__name__ == "Anima":
+                tokenizer = p.sd_model.text_processing_engine_anima.tokenize_line
+                self.modeltype = modeltype = "Anima"
             elif hasattr(p.sd_model, "text_processing_engine_l"):
                 tokenizer = p.sd_model.text_processing_engine_l.tokenize_line
             else:
@@ -158,6 +163,15 @@ class Script(modules.scripts.Script):
                 
         else:
             tokenizer = shared.sd_model.conditioner.embedders[0].tokenize_line if self.isxl else shared.sd_model.cond_stage_model.tokenize_line
+
+        if modeltype == "Anima":
+            self.active = active
+            setup_anima_hooks(self, p)
+            print("NegPiP enable, Anima")
+            p.extra_generation_params.update({
+                "NegPiP Active":active,
+            })
+            return
 
         def getshedulednegs(scheduled,prompts):
             output = []
@@ -339,6 +353,9 @@ class Script(modules.scripts.Script):
        
     def denoiser_callback(self, params: CFGDenoiserParams):
         if debug: print("denoiser_callback",params.sampling_step, params.text_cond.shape)
+        if self.modeltype == "Anima":
+            return
+
         if self.active:
             if self.x is None: self.x = params.x.shape
             if self.x != params.x.shape: self.hr = True
@@ -390,12 +407,17 @@ class Script(modules.scripts.Script):
 from pprint import pprint
 
 def unload(self,p):
+    if getattr(self, "anima_patched", False):
+        restore_anima_hooks(self, p)
+
     if hasattr(self,"handle"):
         if forge:
             if self.modeltype == "flux":
                 hook_forwards_f(self, p.sd_model.forge_objects.unet.model, remove=True)   
             elif self.modeltype == "ZImage":
                 hook_forwards_z(self, p.sd_model.forge_objects.unet.model, remove=True)
+            elif self.modeltype == "Anima":
+                hook_forwards_a(self, p.sd_model.forge_objects.unet.model, remove=True)
             else:
                 hook_forwards(self, p.sd_model.forge_objects.unet.model, remove=True)
         else:
@@ -615,6 +637,13 @@ def hook_forwards_z(self, root_module: torch.nn.Module, remove=False):
             if remove:
                 del module.forward
 
+def hook_forwards_a(self, root_module: torch.nn.Module, remove=False):
+    for name, module in root_module.named_modules():
+        if "cross_attn" in name and module.__class__.__name__ == "SelfCrossAttention":
+            module.forward = hook_forward_a(self, module)
+            if remove:
+                del module.forward
+
 def resetpcache(p):
     p.cached_c = [None,None]
     p.cached_uc = [None,None]
@@ -805,6 +834,172 @@ def hook_forward_f_z(self, module):
         return module.out(output)
     
     return joint_atten_forward
+
+def build_anima_negpip_mask(text_processing_engine, line, token_length, device, dtype):
+    chunks = text_processing_engine.tokenize_line(line)
+    multipliers = []
+    for chunk in chunks:
+        multipliers.extend(getattr(chunk, "t5_multipliers", []))
+
+    if len(multipliers) == 0:
+        return torch.ones(token_length, device=device, dtype=dtype)
+
+    weights = torch.tensor(multipliers, device=device, dtype=dtype)
+    ones = torch.ones_like(weights)
+    mask = torch.where(weights < 0, -ones, ones)
+
+    if mask.shape[0] < token_length:
+        mask = F.pad(mask, (0, token_length - mask.shape[0]), value=1.0)
+    elif mask.shape[0] > token_length:
+        mask = mask[:token_length]
+
+    return mask
+
+def hook_get_learned_conditioning_anima(self, model, original_get_learned_conditioning):
+    text_processing_engine = model.text_processing_engine_anima
+
+    def get_learned_conditioning(prompt):
+        conds = original_get_learned_conditioning(prompt)
+        if not self.active or not isinstance(conds, list):
+            return conds
+
+        prompt_lines = list(prompt)
+        if len(prompt_lines) != len(conds):
+            return conds
+
+        crossattn = []
+        negpip_mask = []
+        for line, cond in zip(prompt_lines, conds):
+            if not isinstance(cond, torch.Tensor):
+                return conds
+
+            cond_data = cond.reshape(-1, cond.shape[-1]) if cond.ndim > 2 else cond
+            if cond_data.ndim != 2:
+                return conds
+
+            mask = build_anima_negpip_mask(text_processing_engine, line, cond_data.shape[0], cond_data.device, cond_data.dtype)
+            crossattn.append(cond_data * mask.unsqueeze(-1).to(cond_data))
+            negpip_mask.append(mask.unsqueeze(-1).to(cond_data))
+
+        return {
+            COND_KEY_C: torch.stack(crossattn, dim=0),
+            "c_negpip_mask": torch.stack(negpip_mask, dim=0),
+        }
+
+    return get_learned_conditioning
+
+def hook_compile_conditions_anima(self, condition_module):
+    original_compile_conditions = self.anima_orig_compile_conditions
+
+    def compile_conditions(cond):
+        if cond is None:
+            return None
+
+        if isinstance(cond, dict) and COND_KEY_C in cond and COND_KEY_V not in cond:
+            cross_attn = cond[COND_KEY_C]
+            model_conds = {"c_crossattn": condition_module.ConditionCrossAttn(cross_attn)}
+            if "c_negpip_mask" in cond:
+                model_conds["c_negpip_mask"] = condition_module.Condition(cond["c_negpip_mask"])
+            return [dict(cross_attn=cross_attn, model_conds=model_conds)]
+
+        return original_compile_conditions(cond)
+
+    return compile_conditions
+
+def hook_forward_anima_model(self, module, original_forward):
+    def forward(x: torch.Tensor, timesteps: torch.Tensor, context: torch.Tensor, fps: torch.Tensor | None = None, padding_mask: torch.Tensor | None = None, **kwargs):
+        transformer_options = kwargs.get("transformer_options", {})
+        transformer_options = dict(transformer_options) if transformer_options is not None else {}
+
+        negpip_mask = kwargs.get("c_negpip_mask", None)
+        if negpip_mask is None:
+            negpip_mask = torch.ones(context.shape[0], context.shape[1], 1, device=context.device, dtype=context.dtype)
+
+        transformer_options["negpip_mask"] = negpip_mask
+        kwargs["transformer_options"] = transformer_options
+
+        return original_forward(x, timesteps, context, fps, padding_mask, **kwargs)
+
+    return forward
+
+def hook_forward_a(self, module):
+    def forward(x: torch.Tensor, context: torch.Tensor | None = None, rope_emb: torch.Tensor | None = None, transformer_options: dict | None = {}):
+        negpip_mask = transformer_options.get("negpip_mask") if transformer_options else None
+
+        q = module.q_proj(x)
+        context_k = x if context is None else context
+        context_v = context_k
+        if negpip_mask is not None:
+            while negpip_mask.ndim < context_v.ndim:
+                negpip_mask = negpip_mask.unsqueeze(1)
+            context_v = context_v * negpip_mask.to(context_v)
+
+        k = module.k_proj(context_k)
+        v = module.v_proj(context_v)
+
+        q, k, v = map(
+            lambda t: rearrange(t, "b ... (h d) -> b ... h d", h=module.n_heads, d=module.head_dim),
+            (q, k, v),
+        )
+
+        q = module.q_norm(q)
+        k = module.k_norm(k)
+        v = module.v_norm(v)
+
+        if module.is_selfattn and rope_emb is not None:
+            q = module.apply_rotary_pos_emb(q, rope_emb)
+            k = module.apply_rotary_pos_emb(k, rope_emb)
+
+        return module.compute_attention(q, k, v, transformer_options=transformer_options)
+
+    return forward
+
+def setup_anima_hooks(self, p):
+    if getattr(self, "anima_patched", False):
+        return
+
+    import backend.sampling.condition as condition_module
+    import backend.sampling.sampling_function as sampling_function_module
+
+    diffusion_model = p.sd_model.forge_objects.unet.model.diffusion_model
+
+    self.anima_model = p.sd_model
+    self.anima_diffusion_model = diffusion_model
+    self.anima_condition_module = condition_module
+    self.anima_sampling_function_module = sampling_function_module
+
+    self.anima_orig_get_learned_conditioning = p.sd_model.get_learned_conditioning
+    self.anima_orig_forward = diffusion_model.forward
+    self.anima_orig_compile_conditions = condition_module.compile_conditions
+    self.anima_orig_sampling_compile_conditions = sampling_function_module.compile_conditions
+
+    p.sd_model.get_learned_conditioning = hook_get_learned_conditioning_anima(self, p.sd_model, self.anima_orig_get_learned_conditioning)
+    diffusion_model.forward = hook_forward_anima_model(self, diffusion_model, self.anima_orig_forward)
+
+    compile_conditions = hook_compile_conditions_anima(self, condition_module)
+    condition_module.compile_conditions = compile_conditions
+    sampling_function_module.compile_conditions = compile_conditions
+
+    self.handle = hook_forwards_a(self, p.sd_model.forge_objects.unet.model)
+    self.anima_patched = True
+
+def restore_anima_hooks(self, p):
+    if not getattr(self, "anima_patched", False):
+        return
+
+    if hasattr(self, "anima_model") and hasattr(self, "anima_orig_get_learned_conditioning"):
+        self.anima_model.get_learned_conditioning = self.anima_orig_get_learned_conditioning
+
+    if hasattr(self, "anima_diffusion_model") and hasattr(self, "anima_orig_forward"):
+        self.anima_diffusion_model.forward = self.anima_orig_forward
+
+    if hasattr(self, "anima_condition_module") and hasattr(self, "anima_orig_compile_conditions"):
+        self.anima_condition_module.compile_conditions = self.anima_orig_compile_conditions
+
+    if hasattr(self, "anima_sampling_function_module") and hasattr(self, "anima_orig_sampling_compile_conditions"):
+        self.anima_sampling_function_module.compile_conditions = self.anima_orig_sampling_compile_conditions
+
+    self.anima_patched = False
 
 class InputAccordionImpl(gr.Checkbox):
     webui_do_not_create_gradio_pyi_thank_you = True
