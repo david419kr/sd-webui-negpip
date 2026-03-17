@@ -10,7 +10,10 @@ Extension for Stable Diffusion web-ui enables negative prompt in prompt
 ### This is an unofficial forked version of negpip, supporting anima in forge NEO.
 ## Unofficial Forked Update 2026.03.16.1700(JST)
 - support anima in Forge NEO  
-I'm not sure about code quality, but it works anyway.
+I'm not sure about code quality, but it works anyway. Some examples below.
+<img width="4096" height="1248" alt="image" src="https://github.com/user-attachments/assets/e3b97322-0feb-4d70-9134-746b4dce7a78" />
+<img width="4096" height="1248" alt="image" src="https://github.com/user-attachments/assets/07a54607-9a70-42f2-bb99-76b9caa4491c" />
+
 
 ## Update 2025.11.30.0100(JST)
 - support Z-Image in Forge NEO
